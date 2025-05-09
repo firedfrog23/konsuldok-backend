@@ -55,10 +55,7 @@ const config = {
     db: {
         uri: process.env.MONGO_URI,
         name: process.env.DB_NAME || 'konsuldok',
-        options: { // Optional: Add Mongoose connection options if needed
-            // useNewUrlParser: true, // Deprecated but sometimes needed for older versions
-            // useUnifiedTopology: true, // Deprecated
-            // autoIndex: process.env.NODE_ENV === 'development', // Auto build indexes in dev
+        options: {
         },
     },
 
@@ -75,6 +72,7 @@ const config = {
         origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*', // Handle comma-separated origins or default
         methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
         credentials: true, // Allow cookies to be sent
+        allowedHeaders: ['Content-Type', 'Authorization']
     },
 
     rateLimit: {

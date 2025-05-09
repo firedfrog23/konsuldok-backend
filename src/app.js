@@ -20,6 +20,7 @@ app.use(cors({
     origin: config.cors.origin,
     methods: config.cors.methods,
     credentials: config.cors.credentials,
+    allowedHeaders: config.cors.allowedHeaders
 }));
 
 // 2. Set various HTTP headers for security
