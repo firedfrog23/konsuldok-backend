@@ -1,60 +1,73 @@
 // src/api/services/appointment.service.js
-// Placeholder for appointment scheduling and management logic
-
-import Appointment from '../../models/appointment.model.js'; // Adjust path
-import DoctorProfile from '../../models/doctorProfile.model.js'; // Adjust path
-import PatientProfile from '../../models/patientProfile.model.js'; // Adjust path
-import { ApiError } from '../../utils/ApiError.js'; // Adjust path
-import { AppointmentStatus, UserRoles } from '../../utils/constants.js'; // Adjust path
-import logger from '../../utils/logger.js'; // Adjust path
+import Appointment from '../../models/appointment.model.js';
+import DoctorProfile from '../../models/doctorProfile.model.js';
+import PatientProfile from '../../models/patientProfile.model.js';
+import { ApiError } from '../../utils/ApiError.js';
+import { AppointmentStatus, UserRoles } from '../../utils/constants.js';
+import logger from '../../utils/logger.js';
 
 /**
- * Check doctor's availability for a given time slot using the simple approach.
+ * Check doctor's availability for a given time slot based on weeklySchedule.
  * @param {string} doctorId - DoctorProfile ID.
- * @param {Date} requestedStartTime - Start time of the requested appointment.
+ * @param {Date} requestedStartTimeDate - Start Date object of the requested appointment.
  * @param {number} durationMinutes - Duration of the requested appointment.
- * @param {string} [excludeAppointmentId=null] - Optional: ID of an appointment to exclude from conflict checks (used when rescheduling).
+ * @param {string} [excludeAppointmentId=null] - Optional: ID of an appointment to exclude from conflict checks.
  * @returns {Promise<boolean>} True if available, false otherwise.
  */
-const checkDoctorAvailabilitySimple = async (doctorId, requestedStartTime, durationMinutes, excludeAppointmentId = null) => {
-    logger.debug(`Checking availability for doctor ${doctorId} at ${requestedStartTime} for ${durationMinutes} mins`);
+const checkDoctorAvailability = async (doctorId, requestedStartTimeDate, durationMinutes, excludeAppointmentId = null) => {
+    logger.debug(`Checking availability for doctor ${doctorId} at ${requestedStartTimeDate} for ${durationMinutes} mins`);
 
     const doctorProfile = await DoctorProfile.findById(doctorId);
-    if (!doctorProfile) throw new ApiError(404, 'Doctor profile not found.');
+    if (!doctorProfile) {
+        throw new ApiError(404, 'Doctor profile not found for availability check.');
+    }
 
-    const requestedEndTime = new Date(requestedStartTime.getTime() + durationMinutes * 60000);
-    const dayOfWeek = requestedStartTime.getDay(); // 0 = Sunday, 6 = Saturday
+    const requestedEndTimeDate = new Date(requestedStartTimeDate.getTime() + durationMinutes * 60000);
+    const requestedDayOfWeek = requestedStartTimeDate.getDay(); // 0 (Sunday) - 6 (Saturday)
 
-    // 1. Check if the day is an available day
-    if (!doctorProfile.availableDays.includes(dayOfWeek)) {
-        logger.debug(`Doctor ${doctorId} not available on day ${dayOfWeek}`);
+    // 1. Check if the doctor works on the requestedDayOfWeek and if the time falls within any scheduled block
+    const workingBlocksForDay = doctorProfile.weeklySchedule.filter(slot => slot.dayOfWeek === requestedDayOfWeek);
+
+    // --- FIX: Corrected variable name from workingSlotsForDay to workingBlocksForDay ---
+    if (workingBlocksForDay.length === 0) {
+        logger.debug(`Doctor ${doctorId} has no working blocks scheduled for dayOfWeek ${requestedDayOfWeek}`);
         return false;
     }
 
-    // 2. Check if the time slot falls within the general available hours
-    const formatTime = (date) => date.toTimeString().substring(0, 5); // HH:MM format
-    const reqStartTimeStr = formatTime(requestedStartTime);
-    const reqEndTimeStr = formatTime(requestedEndTime);
+    // Convert requestedStartTimeDate and requestedEndTimeDate to "HH:MM" strings for comparison
+    const formatToHHMM = (date) => {
+        const hours = String(date.getHours()).padStart(2, '0');
+        const minutes = String(date.getMinutes()).padStart(2, '0');
+        return `${hours}:${minutes}`;
+    };
+    const requestedStartTimeHHMM = formatToHHMM(requestedStartTimeDate);
+    const requestedEndTimeHHMM = formatToHHMM(requestedEndTimeDate);
 
-    if (reqStartTimeStr < doctorProfile.availableStartTime || reqEndTimeStr > doctorProfile.availableEndTime) {
-        logger.debug(`Requested time ${reqStartTimeStr}-${reqEndTimeStr} outside general availability ${doctorProfile.availableStartTime}-${doctorProfile.availableEndTime}`);
+    let isWithinScheduledBlock = false;
+    // --- FIX: Corrected variable name from workingSlotsForDay to workingBlocksForDay ---
+    for (const block of workingBlocksForDay) {
+        // block.startTime and block.endTime are "HH:MM" strings from the schema
+        if (requestedStartTimeHHMM >= block.startTime && requestedEndTimeHHMM <= block.endTime) {
+            isWithinScheduledBlock = true;
+            break;
+        }
+    }
+
+    if (!isWithinScheduledBlock) {
+        logger.debug(`Requested time ${requestedStartTimeHHMM}-${requestedEndTimeHHMM} is outside doctor's scheduled blocks for dayOfWeek ${requestedDayOfWeek}`);
         return false;
     }
 
-    // 3. Check for conflicting appointments (Confirmed or potentially Requested status)
+    // 2. Check for conflicting appointments (Confirmed or Requested status)
     const conflictQuery = {
         doctor: doctorId,
-        status: { $in: [AppointmentStatus.CONFIRMED, AppointmentStatus.REQUESTED] }, // Check against confirmed/requested
+        status: { $in: [AppointmentStatus.CONFIRMED, AppointmentStatus.REQUESTED] },
         isDeleted: { $ne: true },
-        $or: [ // Check for overlap
-            { appointmentTime: { $lt: requestedEndTime, $gte: requestedStartTime } }, // Starts within the slot
-            { $expr: { $lt: [ "$appointmentTime", requestedStartTime ] }, // Ends within the slot (calculate end time)
-              $expr: { $gt: [ { $add: [ "$appointmentTime", { $multiply: [ "$durationMinutes", 60000 ] } ] }, requestedStartTime ] } },
-            { $expr: { $lte: [ "$appointmentTime", requestedStartTime ] }, // Engulfs the slot
-              $expr: { $gte: [ { $add: [ "$appointmentTime", { $multiply: [ "$durationMinutes", 60000 ] } ] }, requestedEndTime ] } }
-        ]
+        // Check for overlap: (StartA < EndB) and (EndA > StartB)
+        appointmentTime: { $lt: requestedEndTimeDate }, // Existing appointment starts before potential slot ends
+        $expr: { $gt: [{ $add: ["$appointmentTime", { $multiply: ["$durationMinutes", 60000] }] }, requestedStartTimeDate] } // Existing appointment ends after potential slot starts
     };
-    // If rescheduling, exclude the appointment being rescheduled from conflict check
+
     if (excludeAppointmentId) {
         conflictQuery._id = { $ne: excludeAppointmentId };
     }
@@ -62,77 +75,79 @@ const checkDoctorAvailabilitySimple = async (doctorId, requestedStartTime, durat
     const conflictingAppointment = await Appointment.findOne(conflictQuery);
 
     if (conflictingAppointment) {
-        logger.debug(`Conflict found with appointment ${conflictingAppointment._id} for doctor ${doctorId}`);
+        logger.debug(`Conflict found with appointment ${conflictingAppointment._id} for doctor ${doctorId} at ${requestedStartTimeDate}`);
         return false;
     }
 
-    logger.debug(`Doctor ${doctorId} is available at ${requestedStartTime}`);
+    logger.debug(`Doctor ${doctorId} is available at ${requestedStartTimeDate}`);
     return true;
 };
 
 
 /**
  * Create a new appointment request.
- * @param {object} appointmentData - Appointment details (patientId, doctorId, time, reason).
- * @param {object} requestedByUser - The user making the request (Patient or Staff/Admin).
+ * @param {object} appointmentData - Appointment details.
+ * @param {object} requestedByUser - The user making the request.
  * @returns {Promise<object>} The created appointment document.
  */
 export const createAppointment = async (appointmentData, requestedByUser) => {
-    const { patient: patientProfileId, doctor: doctorProfileId, appointmentTime, durationMinutes = 30, reasonForVisit } = appointmentData;
-    logger.debug(`AppointmentService: Creating appointment request by user ${requestedByUser._id} for patient ${patientProfileId}`);
+    const { doctor: doctorProfileId, appointmentTime, durationMinutes = 30, reasonForVisit } = appointmentData;
+    let patientProfileId = appointmentData.patient; // May be provided by Staff/Admin
 
-    // 1. Validate patient and doctor profile IDs exist
+    if (requestedByUser.role === UserRoles.PATIENT) {
+        if (!requestedByUser.patientProfile) {
+            throw new ApiError(400, 'Patient profile not found for the requesting user.');
+        }
+        patientProfileId = requestedByUser.patientProfile.toString();
+    } else if (!patientProfileId) {
+        throw new ApiError(400, 'Patient ID is required when Staff/Admin creates an appointment.');
+    }
+
+    logger.debug(`AppointmentService: Creating appointment request by user ${requestedByUser._id} (Role: ${requestedByUser.role}) for patient ${patientProfileId}`);
+
     const patientExists = await PatientProfile.countDocuments({ _id: patientProfileId, isDeleted: { $ne: true } });
     const doctorExists = await DoctorProfile.countDocuments({ _id: doctorProfileId, isDeleted: { $ne: true } });
+
     if (!patientExists) throw new ApiError(404, 'Patient profile not found.');
     if (!doctorExists) throw new ApiError(404, 'Doctor profile not found.');
 
-    const requestedTime = new Date(appointmentTime);
-    if (isNaN(requestedTime.getTime()) || requestedTime <= new Date()) {
+    const requestedTimeDate = new Date(appointmentTime);
+    if (isNaN(requestedTimeDate.getTime()) || requestedTimeDate.getTime() <= Date.now()) {
         throw new ApiError(400, 'Invalid or past appointment time specified.');
     }
 
-    // 2. Check Doctor Availability
-    const isAvailable = await checkDoctorAvailabilitySimple(doctorProfileId, requestedTime, durationMinutes);
+    const isAvailable = await checkDoctorAvailability(doctorProfileId, requestedTimeDate, durationMinutes);
     if (!isAvailable) {
-        throw new ApiError(400, 'Doctor is not available at the requested time or a conflict exists.');
+        throw new ApiError(409, 'Doctor is not available at the requested time or a conflict exists.');
     }
 
-    // 3. Determine initial status and scheduler
     let initialStatus = AppointmentStatus.REQUESTED;
-    let scheduledBy = null;
+    let scheduledByStaff = null;
     if (requestedByUser.role === UserRoles.STAFF || requestedByUser.role === UserRoles.ADMIN) {
-        initialStatus = AppointmentStatus.CONFIRMED; // Staff/Admin bookings are confirmed directly
-        scheduledBy = requestedByUser._id;
+        initialStatus = AppointmentStatus.CONFIRMED;
+        scheduledByStaff = requestedByUser._id;
     }
 
-    // 4. Create new Appointment document
     const newAppointment = new Appointment({
         patient: patientProfileId,
         doctor: doctorProfileId,
-        appointmentTime: requestedTime,
+        appointmentTime: requestedTimeDate,
         durationMinutes,
         reasonForVisit,
         status: initialStatus,
-        scheduledByStaff: scheduledBy, // Use the correct field name from model
+        scheduledByStaff: scheduledByStaff,
         createdBy: requestedByUser._id,
+        updatedBy: requestedByUser._id,
     });
 
     await newAppointment.save();
     logger.info(`Appointment ${newAppointment._id} created successfully with status ${initialStatus}`);
 
-    // 6. Optional: Send notification to doctor/staff/patient
-    // await sendEmail(...)
-
-    // Populate details before returning
     return getAppointmentById(newAppointment._id);
 };
 
 /**
  * Get appointments based on criteria.
- * @param {object} filterOptions - Criteria like patientId, doctorId, date range, status.
- * @param {object} paginationOptions - Limit, page/skip.
- * @returns {Promise<object>} List of appointments and pagination info.
  */
 export const getAppointments = async (filterOptions = {}, paginationOptions = {}) => {
     const { patientId, doctorId, startDate, endDate, status, sortBy = 'appointmentTime', order = 'asc', limit = 10, page = 1 } = { ...filterOptions, ...paginationOptions };
@@ -157,8 +172,8 @@ export const getAppointments = async (filterOptions = {}, paginationOptions = {}
 
     try {
         const appointments = await Appointment.find(filter)
-            .populate({ path: 'patient', select: 'userAccount', populate: { path: 'userAccount', select: 'firstName lastName' } }) // Populate patient's name
-            .populate({ path: 'doctor', select: 'userAccount specialty', populate: { path: 'userAccount', select: 'firstName lastName' } }) // Populate doctor's name/specialty
+            .populate({ path: 'patient', select: 'userAccount', populate: { path: 'userAccount', select: 'firstName lastName email' } })
+            .populate({ path: 'doctor', select: 'userAccount specialty', populate: { path: 'userAccount', select: 'firstName lastName email' } })
             .sort(sort)
             .skip(skip)
             .limit(limitValue)
@@ -180,15 +195,13 @@ export const getAppointments = async (filterOptions = {}, paginationOptions = {}
 
 /**
  * Get a single appointment by ID, populating details.
- * @param {string} appointmentId - The ID of the appointment.
- * @returns {Promise<object>} The appointment document.
  */
 export const getAppointmentById = async (appointmentId) => {
     logger.debug('AppointmentService: Fetching appointment by ID:', appointmentId);
     const appointment = await Appointment.findOne({ _id: appointmentId, isDeleted: { $ne: true } })
-        .populate({ path: 'patient', select: 'userAccount', populate: { path: 'userAccount', select: 'firstName lastName email phoneNumber' } })
-        .populate({ path: 'doctor', select: 'userAccount specialty', populate: { path: 'userAccount', select: 'firstName lastName email phoneNumber' } })
-        .populate({ path: 'scheduledByStaff', select: 'firstName lastName' }) // Populate staff who scheduled
+        .populate({ path: 'patient', select: 'userAccount dateOfBirth gender', populate: { path: 'userAccount', select: 'firstName lastName email phoneNumber' } })
+        .populate({ path: 'doctor', select: 'userAccount specialty languagesSpoken', populate: { path: 'userAccount', select: 'firstName lastName email phoneNumber profilePictureUrl' } })
+        .populate({ path: 'scheduledByStaff', select: 'firstName lastName role' })
         .select('-__v');
 
     if (!appointment) {
@@ -198,122 +211,87 @@ export const getAppointmentById = async (appointmentId) => {
 };
 
 /**
- * Update an appointment's status or details (e.g., confirm, complete, reschedule).
- * @param {string} appointmentId - The ID of the appointment to update.
- * @param {object} updateData - Data to update (status, appointmentTime, durationMinutes, completionNotes).
- * @param {object} updatedByUser - The user performing the update.
- * @returns {Promise<object>} The updated appointment document.
+ * Update an appointment's status or details.
  */
 export const updateAppointment = async (appointmentId, updateData, updatedByUser) => {
-    logger.debug(`AppointmentService: Updating appointment ${appointmentId} by user ${updatedByUser._id}`);
+    logger.debug(`AppointmentService: Updating appointment ${appointmentId} by user ${updatedByUser._id}`, { updateData });
     const { status, appointmentTime, durationMinutes, completionNotes } = updateData;
 
     const appointment = await Appointment.findOne({ _id: appointmentId, isDeleted: { $ne: true } });
     if (!appointment) throw new ApiError(404, 'Appointment not found.');
 
-    // --- Permission Checks & Logic ---
-    // Example: Only Doctor/Staff/Admin can confirm/complete
-    if ([AppointmentStatus.CONFIRMED, AppointmentStatus.COMPLETED].includes(status)) {
-        if (![UserRoles.DOCTOR, UserRoles.STAFF, UserRoles.ADMIN].includes(updatedByUser.role)) {
-             throw new ApiError(403, 'Forbidden: Only Doctor, Staff, or Admin can confirm/complete appointments.');
-        }
+    if ((status === AppointmentStatus.CONFIRMED || status === AppointmentStatus.COMPLETED) &&
+        ![UserRoles.DOCTOR, UserRoles.STAFF, UserRoles.ADMIN].includes(updatedByUser.role)) {
+        throw new ApiError(403, 'Forbidden: Only Doctor, Staff, or Admin can confirm/complete appointments.');
     }
-    // TODO: Add more detailed permission logic based on role and current status
 
-    // --- Rescheduling Logic ---
     if (appointmentTime) {
         const newTime = new Date(appointmentTime);
         const newDuration = durationMinutes || appointment.durationMinutes;
-        if (isNaN(newTime.getTime()) || newTime <= new Date()) {
+        if (isNaN(newTime.getTime()) || newTime.getTime() <= Date.now()) {
             throw new ApiError(400, 'Invalid or past appointment time specified for reschedule.');
         }
-        // Re-check availability, excluding the current appointment from conflict check
-        const isAvailable = await checkDoctorAvailabilitySimple(appointment.doctor, newTime, newDuration, appointmentId);
+        const isAvailable = await checkDoctorAvailability(appointment.doctor.toString(), newTime, newDuration, appointmentId);
         if (!isAvailable) {
-            throw new ApiError(400, 'Doctor is not available at the requested reschedule time or a conflict exists.');
+            throw new ApiError(409, 'Doctor is not available at the requested reschedule time or a conflict exists.');
         }
         appointment.appointmentTime = newTime;
         if (durationMinutes) appointment.durationMinutes = newDuration;
     }
 
-    // --- Update Status and Notes ---
-    if (status) {
-        // TODO: Validate status transitions (e.g., cannot complete if cancelled)
-        appointment.status = status;
-    }
-    if (completionNotes && status === AppointmentStatus.COMPLETED) {
-        appointment.completionNotes = completionNotes;
-    }
+    if (status) appointment.status = status;
+    if (completionNotes && status === AppointmentStatus.COMPLETED) appointment.completionNotes = completionNotes;
+    if (updateData.cancellationReason && status === AppointmentStatus.CANCELLED) appointment.cancellationReason = updateData.cancellationReason;
 
-    // Set audit field
     appointment.updatedBy = updatedByUser._id;
-
     await appointment.save();
     logger.info(`Appointment ${appointmentId} updated successfully by ${updatedByUser._id}`);
-
-    // Optional: Send notifications on status change/reschedule
-
-    return getAppointmentById(appointmentId); // Re-fetch with populated data
+    return getAppointmentById(appointmentId);
 };
 
 /**
  * Cancel an appointment.
- * @param {string} appointmentId - The ID of the appointment to cancel.
- * @param {string} reason - Reason for cancellation.
- * @param {object} cancelledByUser - The user performing the cancellation.
- * @returns {Promise<object>} The cancelled appointment document.
  */
 export const cancelAppointment = async (appointmentId, reason, cancelledByUser) => {
     logger.warn(`AppointmentService: Cancelling appointment ${appointmentId} by user ${cancelledByUser._id}`);
     const appointment = await Appointment.findOne({ _id: appointmentId, isDeleted: { $ne: true } });
     if (!appointment) throw new ApiError(404, 'Appointment not found.');
 
-    // Check if already cancelled or completed
     if ([AppointmentStatus.CANCELLED, AppointmentStatus.COMPLETED].includes(appointment.status)) {
         throw new ApiError(400, `Cannot cancel appointment with status: ${appointment.status}`);
     }
 
-    // Permission Check
     const isPatientOwner = cancelledByUser.role === UserRoles.PATIENT && appointment.patient.equals(cancelledByUser.patientProfile);
     const isDoctorOwner = cancelledByUser.role === UserRoles.DOCTOR && appointment.doctor.equals(cancelledByUser.doctorProfile);
     const isStaffOrAdmin = [UserRoles.STAFF, UserRoles.ADMIN].includes(cancelledByUser.role);
 
-    // Define who can cancel (e.g., Patient can cancel own REQUESTED/CONFIRMED, others can cancel most)
     let canCancel = false;
     if (isPatientOwner && [AppointmentStatus.REQUESTED, AppointmentStatus.CONFIRMED].includes(appointment.status)) {
-        // Optional: Add time limit check (e.g., cannot cancel within 24 hours)
         canCancel = true;
     } else if (isDoctorOwner || isStaffOrAdmin) {
-        canCancel = true; // Staff/Admin/Doctor can cancel (adjust as needed)
+        canCancel = true;
     }
 
     if (!canCancel) {
         throw new ApiError(403, 'Forbidden: You are not authorized to cancel this appointment.');
     }
 
-    // Update status and reason
     appointment.status = AppointmentStatus.CANCELLED;
     appointment.cancellationReason = reason;
     appointment.updatedBy = cancelledByUser._id;
 
     await appointment.save();
     logger.info(`Appointment ${appointmentId} cancelled successfully by ${cancelledByUser._id}`);
-
-    // Optional: Send cancellation notifications
-
-    return getAppointmentById(appointmentId); // Re-fetch with populated data
+    return getAppointmentById(appointmentId);
 };
 
 /**
  * Delete an appointment (soft delete) - Admin only.
- * @param {string} appointmentId - The ID of the appointment to delete.
- * @param {object} deletedByUser - The user performing the deletion (must be Admin).
- * @returns {Promise<void>}
  */
 export const deleteAppointment = async (appointmentId, deletedByUser) => {
     logger.warn(`AppointmentService: Attempting delete for appointment ${appointmentId} by admin ${deletedByUser._id}`);
     if (deletedByUser.role !== UserRoles.ADMIN) {
-         throw new ApiError(403, 'Forbidden: Only administrators can delete appointments.');
+        throw new ApiError(403, 'Forbidden: Only administrators can delete appointments.');
     }
 
     const appointmentToDelete = await Appointment.findOne({ _id: appointmentId, isDeleted: { $ne: true } });
@@ -321,7 +299,6 @@ export const deleteAppointment = async (appointmentId, deletedByUser) => {
         throw new ApiError(404, 'Appointment not found or already deleted.');
     }
 
-    // Perform soft delete
     await appointmentToDelete.softDelete(deletedByUser._id);
     logger.info(`Appointment ${appointmentId} soft deleted successfully by admin ${deletedByUser._id}`);
 };
